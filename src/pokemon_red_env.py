@@ -1,23 +1,28 @@
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import Env, spaces
 import numpy as np
 from pyboy import PyBoy
 from pyboy.utils import WindowEvent
 import time
 import hashlib
 
-class PokemonRedEnv(gym.Env):
+class PokemonRedEnv(Env):
     """
-    Entorno de PyBoy para Pokémon Rojo basado en la API de OpenAI Gym.
+    Entorno de PyBoy para Pokémon Rojo basado en la API de Gymnasium.
+    Se puede configurar para avanzar múltiples frames por acción (frame skip)
+    y renderizar solo el último frame, para acelerar el entrenamiento o visualizar el juego.
     """
     metadata = {'render.modes': ['human']}
 
-    def __init__(self, rom_path="roms/PokemonRed.gb", window="null"):
+    def __init__(self, rom_path="roms/PokemonRed.gb", window="null", frame_skip=1):
         super(PokemonRedEnv, self).__init__()
         self.rom_path = rom_path
+        self.frame_skip = frame_skip
+        # Inicializamos PyBoy en el modo indicado ("null" para headless o "SDL2" para visualización)
         self.pyboy = PyBoy(rom_path, window=window)
+        self.pyboy.set_emulation_speed(0)  # Velocidad máxima
         
-        # Definir espacio de acciones: 8 acciones básicas (arriba, abajo, izquierda, derecha, A, B, Start, Select)
+        # Definir 8 acciones básicas
         self.actions = {
             0: WindowEvent.PRESS_ARROW_UP,
             1: WindowEvent.PRESS_ARROW_DOWN,
@@ -29,42 +34,43 @@ class PokemonRedEnv(gym.Env):
             7: WindowEvent.PRESS_BUTTON_SELECT
         }
         self.action_space = spaces.Discrete(len(self.actions))
-        
         # Espacio de observación: imagen RGB de 160x144 píxeles
         self.observation_space = spaces.Box(low=0, high=255, shape=(144, 160, 3), dtype=np.uint8)
-        
-        # Variable para almacenar estados únicos (por ejemplo, mediante hash de la imagen)
+        # Para seguimiento de estados nuevos (novelty)
         self.visited_states = set()
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        if options is None:
+            options = {}
         self.pyboy.stop()
+        # Reinicia el emulador; aquí usamos "SDL2" para visualización o "null" para entrenamiento headless
         self.pyboy = PyBoy(self.rom_path, window="SDL2")
-        time.sleep(2)  # Espera a que el juego cargue
-        # Reiniciamos el set de estados visitados, pues un nuevo episodio empieza desde cero.
+        self.pyboy.set_emulation_speed(0)
+        time.sleep(1)  # Espera mínima para cargar la ROM
         self.visited_states = set()
-        return self._get_observation()
+        return self._get_observation(), {}
 
-    def step(self, action):
+    def step(self, action, frame_skip=1, render=False):
+        # Convierte la acción a entero si es un arreglo de NumPy
+        if isinstance(action, np.ndarray):
+            action = int(action.item())
+            
         if action not in self.actions:
             raise ValueError(f"Acción no válida: {action}")
-        
+    
         # Envía la entrada correspondiente
         self.pyboy.send_input(self.actions[action])
-        
-        # Avanza un tick (tick() devuelve True mientras el juego continúa)
-        running = self.pyboy.tick()
-        
-        # Obtén la observación actual (imagen de pantalla)
+        running = True
+        for i in range(frame_skip):
+            running = self.pyboy.tick(render=(render and i == frame_skip - 1))
+            if not running:
+                break
         obs = self._get_observation()
-        
-        # Calcula la recompensa basada en si el estado (imagen) es nuevo
         reward = self._compute_reward(obs)
-        
-        # Define que el episodio termina cuando el juego finaliza (tick() retorna False)
-        done = not running
-        
+        terminated = not running   # Terminamos si el tick retorna False
+        truncated = False          # No usamos truncado en este ejemplo
         info = {}
-        return obs, reward, done, info
+        return obs, reward, terminated, truncated, info
 
     def render(self, mode='human'):
         return self._get_observation()
@@ -73,44 +79,43 @@ class PokemonRedEnv(gym.Env):
         self.pyboy.stop()
 
     def _get_observation(self):
-        # Extrae la imagen actual del emulador
+        # Extrae la imagen actual del emulador y la convierte a un array NumPy.
         image = self.pyboy.screen.image
         obs = np.array(image)
-        # Si es 2D (escala de grises), lo convertimos a 3 canales replicando la imagen
-        if len(obs.shape) == 2:
+        if len(obs.shape) == 2:  # Si es escala de grises, replicar en 3 canales
             obs = np.stack([obs] * 3, axis=-1)
-        # Si tiene 4 canales (RGBA), descartamos el canal alfa
-        elif len(obs.shape) == 3 and obs.shape[-1] == 4:
+        elif len(obs.shape) == 3 and obs.shape[-1] == 4:  # Si tiene canal alfa, descartarlo
             obs = obs[..., :3]
         return obs
 
     def _compute_reward(self, obs):
         """
-        Función de recompensa para premiar la exploración de nuevas áreas.
-        Se calcula un hash MD5 de la observación (imagen) y se compara con estados previamente vistos.
-        Si es nuevo, se otorga una recompensa positiva.
+        Función de recompensa combinada:
+         - Novelty: +1 si la observación (imagen) no ha sido vista antes.
+         - Penalización por tick: -0.01.
+         - (Placeholder) Recompensa por progreso: 0.
         """
-        # Convertir la observación a bytes
         obs_bytes = obs.tobytes()
         obs_hash = hashlib.md5(obs_bytes).hexdigest()
-        if obs_hash not in self.visited_states:
+        novelty_reward = 1 if obs_hash not in self.visited_states else 0
+        if novelty_reward:
             self.visited_states.add(obs_hash)
-            return 1  # Recompensa por explorar un nuevo estado
-        return 0
+        time_penalty = -0.01
+        progress_reward = 0
+        return novelty_reward + time_penalty + progress_reward
 
-# Ejemplo de prueba (puedes usarlo en test_env.py)
+# Bloque de prueba para el entorno (opcional)
 if __name__ == "__main__":
-    env = PokemonRedEnv()
-    obs = env.reset()
+    env = PokemonRedEnv("roms/PokemonRed.gb", window="null", frame_skip=100)
+    obs, info = env.reset()
     print("Observación inicial:", obs.shape)
     done = False
     tick_count = 0
-
-    while not done and tick_count < 100:
+    while not done:
         action = env.action_space.sample()
-        obs, reward, done, info = env.step(action)
-        tick_count += 1
+        obs, reward, terminated, truncated, info = env.step(action)
+        tick_count += env.frame_skip
         print(f"Tick {tick_count} - Recompensa: {reward}")
-        time.sleep(0.1)
+        done = terminated or truncated
     env.close()
     print("Prueba del entorno finalizada.")
